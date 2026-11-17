@@ -31,6 +31,255 @@ load_dotenv()
 
 # =============================================================================
 # Your code: add imports, constants and helper functions here.
+from bs4 import BeautifulSoup
+
+def _clean_cell_text(tag) -> str:
+    return re.sub(r"\s+", " ", tag.get_text(" ", strip=True)).strip()
+def _extract_doc_meta(file_name: str, soup: BeautifulSoup) -> dict[str, Any]:
+    title_text = _clean_cell_text(soup.title) if soup.title else ""
+    h1 = soup.find("h1")
+    h1_text = _clean_cell_text(h1) if h1 else ""
+    h2 = soup.find("h2")
+    h2_text = _clean_cell_text(h2) if h2 else ""
+    broker_div = soup.find("div", class_="broker")
+    top_text = " ".join([title_text, h1_text, h2_text, _clean_cell_text(broker_div) if broker_div else ""])
+
+    if broker_div or "equity research" in top_text.lower() or "results review" in top_text.lower():
+        doc_type = "research_report"
+    elif "earnings conference call" in top_text.lower() or "earnings call" in top_text.lower():
+        doc_type = "earnings_call"
+    else:
+        doc_type = "annual_report"
+
+    if doc_type in ("earnings_call", "research_report"):
+        company = re.sub(r"\s*\([^)]*\)\s*$", "", h1_text).strip()
+    else:
+        company = h1_text.strip()
+
+    fiscal_year: int | None = None
+    if doc_type == "annual_report":
+        m = re.search(r"Annual Report\s+(\d{4})", top_text, re.I)
+        if not m:
+            body_head = _clean_cell_text(soup.body)[:800] if soup.body else ""
+            m = re.search(r"(?:Annual Report|31 December)\s+(\d{4})", body_head, re.I)
+        if m:
+            fiscal_year = int(m.group(1))
+    elif doc_type == "earnings_call":
+        m = re.search(r"Full Year\s+(\d{4})", top_text, re.I)
+        fiscal_year = int(m.group(1)) if m else 2025
+    else:
+        m = re.search(r"FY\s*(\d{4})\s+results review", top_text, re.I)
+        fiscal_year = int(m.group(1)) if m else 2025
+
+    return {
+        "source": file_name,
+        "company": company,
+        "fiscal_year": fiscal_year if fiscal_year is not None else 2025,
+        "doc_type": doc_type,
+    }
+
+
+def _iter_blocks(node):
+    for child in node.children:
+        if not getattr(child, "name", None):
+            txt = re.sub(r"\s+", " ", str(child)).strip()
+            if txt:
+                yield ("raw", txt)
+            continue
+        name = child.name.lower()
+        if name in ("nav", "style", "script", "head"):
+            continue
+        if name == "table":
+            yield ("table", child)
+        elif name in ("h1", "h2", "h3", "h4"):
+            yield ("heading", child)
+        elif name in ("ul", "ol"):
+            yield ("list", child)
+        elif name == "p":
+            yield ("text", child)
+        elif name == "div":
+            if child.find(["h1", "h2", "h3", "h4", "p", "ul", "ol", "table", "div"]) is not None:
+                yield from _iter_blocks(child)
+            else:
+                yield ("text", child)
+        else:
+            yield from _iter_blocks(child)
+
+
+def _split_long_text(text: str, limit: int) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+    parts: list[str] = []
+    # 优先按换行切分，再按句子/空格切分，保证每块不超过 limit
+    lines = text.splitlines()
+    cur = ""
+    for line in lines:
+        if len(line) > limit:
+            if cur:
+                parts.append(cur)
+                cur = ""
+            words = line.split(" ")
+            wcur = ""
+            for w in words:
+                if len(w) > limit:
+                    if wcur:
+                        parts.append(wcur)
+                        wcur = ""
+                    for i in range(0, len(w), limit):
+                        parts.append(w[i : i + limit])
+                else:
+                    cand = f"{wcur} {w}".strip() if wcur else w
+                    if len(cand) <= limit:
+                        wcur = cand
+                    else:
+                        parts.append(wcur)
+                        wcur = w
+            if wcur:
+                parts.append(wcur)
+        else:
+            cand = f"{cur}\n{line}" if cur else line
+            if len(cand) <= limit:
+                cur = cand
+            else:
+                parts.append(cur)
+                cur = line
+    if cur:
+        parts.append(cur)
+    return parts
+
+_PARSE_CACHE: dict[str, dict[str, Any]] = {}
+_PARSE_LLM = None
+
+_PARSE_PROMPT = """Extract structured metadata from the financial question below. Return ONLY valid JSON with three keys: "companies", "fiscal_year", "doc_type".
+
+Rules:
+1. "companies": a list of strings containing EVERY target company the question asks about, as named in the question.
+   - Include companies even if they might not exist in a database (e.g., if comparing two companies, include both).
+   - Do NOT include brokerage firms / equity research firms (e.g., BuyFin Capital, Meridian Equity Research) or audit firms.
+2. "fiscal_year": an integer (e.g., 2024) for the fiscal year explicitly named in the question ("FY2024" -> 2024, "31 December 2024" -> 2024), or null if the question does not name any year.
+   - Use the year named in the question itself (e.g., "FY2023 revenue" -> 2023; "FY2026 revenue forecast" -> 2026).
+3. "doc_type": one of "annual_report", "earnings_call", "research_report":
+   - "earnings_call" if the question asks about an earnings call / conference call / Q&A / management call remarks or guidance mentioned on a call.
+   - "research_report" if the question asks about a broker's rating, 12-month target price, share price target, forecast/estimate, peer valuation, or results review.
+   - "annual_report" otherwise.
+
+Examples:
+Question: "What FY2026 revenue does Meridian Equity Research forecast for Sablewood Retail, in USD millions?"
+JSON: {"companies": ["Sablewood Retail"], "fiscal_year": 2026, "doc_type": "research_report"}
+
+Question: "Which company held more cash and cash equivalents at 31 December 2024: Northgate Robotics or Northgate Payments?"
+JSON: {"companies": ["Northgate Robotics", "Northgate Payments"], "fiscal_year": 2024, "doc_type": "annual_report"}
+
+Question: "In which city is Halcyon Freight headquartered?"
+JSON: {"companies": ["Halcyon Freight"], "fiscal_year": null, "doc_type": "annual_report"}
+
+Question: "What 12-month target price does BuyFin Capital set for Kestrel Semiconductor's shares in its FY2025 results review, in USD?"
+JSON: {"companies": ["Kestrel Semiconductor"], "fiscal_year": 2025, "doc_type": "research_report"}
+
+Question: {question}
+JSON:"""
+
+from rank_bm25 import BM25Okapi
+
+_STOP_WORDS = {
+    "what", "was", "were", "which", "who", "whom", "whose", "where", "when", "how",
+    "did", "does", "do", "is", "are", "the", "a", "an", "of", "in", "at", "for",
+    "to", "and", "or", "by", "from", "with", "on", "as", "its", "their", "his",
+    "her", "that", "this", "it", "be", "been", "had", "has", "have", "held",
+    "more", "higher", "most", "much", "many", "usd", "millions", "million",
+    "percent", "company", "end", "fiscal", "year", "fy", "december", "31",
+}
+
+_SYNONYMS = {
+    "cash": ["equivalents"],
+    "cfo": ["chief", "financial", "officer"],
+    "ceo": ["chief", "executive", "officer"],
+    "auditor": ["independent", "audit", "firm"],
+    "audited": ["independent", "auditor", "audit"],
+    "headquartered": ["headquarters"],
+    "headcount": ["employees"],
+    "employees": ["headcount", "function"],
+    "repurchase": ["share", "repurchase", "programme", "buyback"],
+    "buyback": ["share", "repurchase", "programme"],
+    "guidance": ["outlook", "guided", "guide"],
+    "guide": ["guidance", "outlook"],
+    "debt": ["borrowings"],
+    "borrowings": ["debt", "short-term", "long-term"],
+    "receivable": ["accounts", "receivable", "trade"],
+    "receivables": ["accounts", "receivable", "trade"],
+    "target": ["12-month", "target", "price"],
+    "rating": ["rating", "buy", "hold", "reduce"],
+}
+
+_RERANK_LLM = None
+
+_RERANK_PROMPT = """You are a financial RAG reranker and answerability checker.
+Given a user question and numbered candidate passages (each tagged with its company, fiscal_year, and doc_type), do two things:
+1. Check if the candidate passages ACTUALLY contain the information needed to answer the question for the specified company/companies and fiscal year.
+   - If the question asks for a specific metric, event, or fact that is NOT disclosed or not present in ANY candidate passage (for example: lobbying expenses, carbon offset purchases, customer churn rate, revenue from largest customer when not mentioned), set "answerable" to false.
+   - If the question compares two companies, BOTH companies must have their relevant information present in the candidates; otherwise set "answerable" to false.
+2. If answerable is true, select the 1 to 5 BEST passage indices (most useful first) needed to answer the question accurately.
+   - Prefer exact figures in financial tables over rounded figures in letters or earnings calls.
+   - For comparisons between two companies, include the best passage(s) for EACH company.
+
+Return ONLY valid JSON: {"answerable": true/false, "selected": [indices]}
+
+Question: {question}
+
+Candidates:
+{candidates}
+
+JSON:"""
+
+
+def _bm25_tokenize(text: str, expand: bool = False) -> list[str]:
+    norm = unicodedata.normalize("NFKC", text).lower()
+    # 去掉数字中的千分位逗号，保留小数点
+    norm = re.sub(r"(?<=\d),(?=\d)", "", norm)
+    tokens = re.findall(r"[a-z0-9]+(?:\.[0-9]+)?", norm)
+    kept = [t for t in tokens if t not in _STOP_WORDS and len(t) > 1 or t.isdigit()]
+    if expand:
+        extra: list[str] = []
+        for t in kept:
+            extra.extend(_SYNONYMS.get(t, []))
+        kept.extend(extra)
+    return kept
+
+
+def _select_target_years(avail_years: set[int], req_year: int | None, doc_type: str) -> list[int]:
+    if not avail_years:
+        return []
+    if req_year is None:
+        return sorted(avail_years, reverse=True)
+    if doc_type == "annual_report":
+        # 某年的年报同时包含当年与上一年（例如 2024 年报有 2024 和 2023，2025 年报有 2025 和 2024）
+        if req_year in avail_years:
+            # 优先当年年报；若有次年年报也可作为补充（但当年年报放前面更稳，避免人事变更混淆）
+            return [req_year]
+        if (req_year + 1) in avail_years:
+            return [req_year + 1]
+        return []
+    elif doc_type == "research_report":
+        # 研报通常包含 FY2024A, FY2025A, FY2026E, FY2027E
+        max_y = max(avail_years)
+        if max_y - 1 <= req_year <= max_y + 2:
+            return sorted(avail_years, reverse=True)
+        return []
+    else:  # earnings_call
+        # Q4 FY2025 电话会包含 FY2025 业绩和 FY2026 指引
+        max_y = max(avail_years)
+        if max_y <= req_year <= max_y + 1:
+            return sorted(avail_years, reverse=True)
+        return []
+
+
+def _bm25_rank_subset(subset_indices: list[int], index: dict[str, Any], query_tokens: list[str], top_k: int) -> list[int]:
+    if not subset_indices or not query_tokens:
+        return subset_indices[:top_k]
+    bm25: BM25Okapi = index["bm25"]
+    all_scores = bm25.get_scores(query_tokens)
+    ranked = sorted(subset_indices, key=lambda idx: all_scores[idx], reverse=True)
+    return ranked[:top_k]
 # =============================================================================
 
 
@@ -43,7 +292,95 @@ def table_to_text(table_html: str) -> str:
     LLM here.
     """
     ### YOUR CODE HERE
-    return ""
+    soup = BeautifulSoup(table_html, "html.parser")
+    table = soup.find("table") or soup
+
+    lines: list[str] = []
+    cap = table.find("caption")
+    if cap:
+        cap_text = _clean_cell_text(cap)
+        if cap_text:
+            lines.append(cap_text)
+
+    # 1. 提取表头（支持 thead 或首行 th，支持 colspan）
+    headers: list[str] = []
+    thead = table.find("thead")
+    header_trs = thead.find_all("tr") if thead else []
+    body_trs = []
+
+    if header_trs:
+        # 若有多行表头，取最后一行或拼接；通常这里只有一行
+        for cell in header_trs[-1].find_all(["th", "td"]):
+            text = _clean_cell_text(cell)
+            colspan = int(cell.get("colspan", 1) or 1)
+            headers.extend([text] * colspan)
+        tbody = table.find("tbody")
+        body_trs = tbody.find_all("tr") if tbody else [
+            tr for tr in table.find_all("tr") if tr not in header_trs
+        ]
+    else:
+        all_trs = table.find_all("tr")
+        if all_trs and all_trs[0].find("th"):
+            for cell in all_trs[0].find_all(["th", "td"]):
+                text = _clean_cell_text(cell)
+                colspan = int(cell.get("colspan", 1) or 1)
+                headers.extend([text] * colspan)
+            body_trs = all_trs[1:]
+        else:
+            body_trs = all_trs
+
+    # 2. 逐行提取数据
+    for tr in body_trs:
+        raw_cells = tr.find_all(["td", "th"])
+        if not raw_cells:
+            continue
+        cells: list[str] = []
+        for cell in raw_cells:
+            text = _clean_cell_text(cell)
+            colspan = int(cell.get("colspan", 1) or 1)
+            cells.extend([text] * colspan)
+
+        if not any(cells):
+            continue
+
+        # 只有一列的分组小标题行（例如资产负债表里的 "Current assets"）
+        non_empty = [c for c in cells if c]
+        if len(raw_cells) == 1 or (len(non_empty) == 1 and not cells[1:]):
+            lines.append(non_empty[0])
+            continue
+
+        row_label = cells[0]
+        pairs: list[str] = []
+        for i in range(1, len(cells)):
+            val = cells[i]
+            if not val:
+                continue
+            col = headers[i] if i < len(headers) and headers[i] else f"col_{i}"
+            pairs.append(f"{col}: {val}")
+
+        if not pairs:
+            if row_label:
+                lines.append(row_label)
+            continue
+
+        full_line = f"{row_label} | " + " | ".join(pairs) if row_label else " | ".join(pairs)
+        if len(full_line) <= MAX_LINE_CHARS:
+            lines.append(full_line)
+        else:
+            # 防止极宽表格超过 400 字符被评分器丢弃，按 400 字符内拆分但每行保留 row_label
+            cur = row_label
+            for p in pairs:
+                candidate = f"{cur} | {p}" if cur else p
+                if len(candidate) <= MAX_LINE_CHARS:
+                    cur = candidate
+                else:
+                    if cur:
+                        lines.append(cur)
+                    cur = f"{row_label} | {p}" if row_label else p
+            if cur:
+                lines.append(cur)
+
+    return "\n".join(lines)
 
 
 def chunk_document(file_name: str, html: str) -> list[Document]:
@@ -52,8 +389,112 @@ def chunk_document(file_name: str, html: str) -> list[Document]:
     Every chunk needs the metadata "source" (= file_name), "company", "fiscal_year" (an int) and
     "doc_type" (one of DOC_TYPES). Do not call the LLM here.
     """
-    ### YOUR CODE HERE
-    return []
+    soup = BeautifulSoup(html, "html.parser")
+    meta = _extract_doc_meta(file_name, soup)
+    root = soup.body or soup
+
+    chunks: list[Document] = []
+    section = ""
+    buf: list[str] = []
+    skip_next_toc_list = False
+    target_text_limit = MAX_CHUNK_CHARS - 120
+
+    def make_doc(text: str) -> Document:
+        return Document(page_content=text[:MAX_CHUNK_CHARS], metadata=dict(meta))
+
+    def flush_buf() -> None:
+        nonlocal buf
+        if not buf:
+            return
+        header = f"[{section}]\n" if section else ""
+        avail = MAX_CHUNK_CHARS - len(header)
+        cur = ""
+        for item in buf:
+            for piece in _split_long_text(item, avail):
+                cand = f"{cur}\n{piece}" if cur else piece
+                if len(cand) <= avail:
+                    cur = cand
+                else:
+                    if cur:
+                        chunks.append(make_doc(header + cur))
+                    cur = piece
+        if cur:
+            chunks.append(make_doc(header + cur))
+        buf = []
+
+    for kind, node in _iter_blocks(root):
+        if kind == "heading":
+            txt = _clean_cell_text(node)
+            if not txt:
+                continue
+            if txt.lower() == "contents":
+                flush_buf()
+                skip_next_toc_list = True
+                continue
+            skip_next_toc_list = False
+            flush_buf()
+            section = txt
+        elif kind == "list":
+            if skip_next_toc_list:
+                skip_next_toc_list = False
+                continue
+            items = []
+            for li in node.find_all("li", recursive=False):
+                t = _clean_cell_text(li)
+                if t:
+                    items.append(f"- {t}")
+            if not items:
+                t = _clean_cell_text(node)
+                if t:
+                    items.append(t)
+            if items:
+                buf.append("\n".join(items))
+        elif kind == "table":
+            skip_next_toc_list = False
+            flush_buf()
+            t_text = table_to_text(str(node)).strip()
+            if not t_text:
+                continue
+            header = f"[{section}]\n" if section else ""
+            if len(header) + len(t_text) <= MAX_CHUNK_CHARS:
+                chunks.append(make_doc(header + t_text))
+            else:
+                t_lines = t_text.splitlines()
+                cap_line = t_lines[0] if t_lines else ""
+                prefix = header + (cap_line + "\n" if cap_line else "")
+                avail = MAX_CHUNK_CHARS - len(prefix)
+                if avail < 200:
+                    prefix = (cap_line + "\n") if cap_line else ""
+                    avail = MAX_CHUNK_CHARS - len(prefix)
+                cur_lines: list[str] = []
+                cur_len = 0
+                body_lines = t_lines[1:] if cap_line else t_lines
+                for line in body_lines:
+                    for piece in _split_long_text(line, avail):
+                        add_len = len(piece) + (1 if cur_lines else 0)
+                        if cur_len + add_len <= avail:
+                            cur_lines.append(piece)
+                            cur_len += add_len
+                        else:
+                            if cur_lines:
+                                chunks.append(make_doc(prefix + "\n".join(cur_lines)))
+                            cur_lines = [piece]
+                            cur_len = len(piece)
+                if cur_lines:
+                    chunks.append(make_doc(prefix + "\n".join(cur_lines)))
+        else:
+            skip_next_toc_list = False
+            txt = node if kind == "raw" else _clean_cell_text(node)
+            if txt:
+                buf.append(txt)
+                if sum(len(x) + 1 for x in buf) >= target_text_limit:
+                    last = buf[-1]
+                    flush_buf()
+                    if len(last) <= 300:
+                        buf.append(last)
+
+    flush_buf()
+    return chunks
 
 
 def parse_query(question: str) -> dict:
@@ -61,8 +502,49 @@ def parse_query(question: str) -> dict:
 
     The rules for each field are under Task 2.2 in the handout. You may use make_llm() here.
     """
-    ### YOUR CODE HERE
-    return {}
+    global _PARSE_LLM
+    if question in _PARSE_CACHE:
+        cached = _PARSE_CACHE[question]
+        return {"companies": list(cached["companies"]), "fiscal_year": cached["fiscal_year"], "doc_type": cached["doc_type"]}
+
+    if _PARSE_LLM is None:
+        _PARSE_LLM = make_llm(temperature=0.0, thinking=False, max_tokens=200)
+
+    raw = str(_PARSE_LLM.invoke(_PARSE_PROMPT.replace("{question}", question)).content).strip()
+    m = re.search(r"\{.*\}", raw, re.S)
+    data: dict[str, Any] = {}
+    if m:
+        try:
+            data = json.loads(m.group(0))
+        except Exception:
+            data = {}
+
+    companies = data.get("companies") or []
+    if isinstance(companies, str):
+        companies = [companies]
+    companies = [str(c).strip() for c in companies if str(c).strip()]
+
+    # 校验 fiscal_year：确保确实是问题中提到的年份
+    fy = as_year(data.get("fiscal_year"))
+    years_in_q = [int(y) for y in re.findall(r"(?<!\d)(20\d{2})(?!\d)", question)]
+    if not years_in_q:
+        fy = None
+    elif fy not in years_in_q:
+        fy = years_in_q[-1]
+
+    doc_type = data.get("doc_type")
+    if doc_type not in DOC_TYPES:
+        ql = question.lower()
+        if any(k in ql for k in ("earnings call", "conference call")):
+            doc_type = "earnings_call"
+        elif any(k in ql for k in ("target price", "rating", "forecast", "results review", "estimate")):
+            doc_type = "research_report"
+        else:
+            doc_type = "annual_report"
+
+    result = {"companies": companies, "fiscal_year": fy, "doc_type": doc_type}
+    _PARSE_CACHE[question] = result
+    return {"companies": list(companies), "fiscal_year": fy, "doc_type": doc_type}
 
 
 def build_index(chunks: list[Document]) -> Any:
@@ -70,8 +552,34 @@ def build_index(chunks: list[Document]) -> Any:
 
     Return anything retrieve() needs: a BM25 or TF-IDF index, the chunks grouped by metadata, ...
     """
-    ### YOUR CODE HERE
-    return None
+    tokenized = []
+    by_company: dict[str, list[int]] = {}
+    by_key: dict[tuple[str, str, int], list[int]] = {}
+    years_by_comp_type: dict[tuple[str, str], set[int]] = {}
+
+    for i, doc in enumerate(chunks):
+        meta = doc.metadata or {}
+        comp_name = str(meta.get("company", ""))
+        ckey = company_key(comp_name)
+        dtype = str(meta.get("doc_type", ""))
+        fy = as_year(meta.get("fiscal_year"))
+
+        # 把公司名和标题信息适度纳入词法索引
+        tokenized.append(_bm25_tokenize(doc.page_content, expand=False))
+
+        by_company.setdefault(ckey, []).append(i)
+        if fy is not None:
+            by_key.setdefault((ckey, dtype, fy), []).append(i)
+            years_by_comp_type.setdefault((ckey, dtype), set()).add(fy)
+
+    bm25 = BM25Okapi(tokenized) if tokenized else None
+    return {
+        "chunks": chunks,
+        "bm25": bm25,
+        "by_company": by_company,
+        "by_key": by_key,
+        "years_by_comp_type": years_by_comp_type,
+    }
 
 
 def retrieve(index: Any, question: str) -> list[Document]:
@@ -80,7 +588,103 @@ def retrieve(index: Any, question: str) -> list[Document]:
     Return [] when the corpus cannot answer the question: the generator then answers NOT_FOUND.
     """
     ### YOUR CODE HERE
-    return []
+    global _RERANK_LLM
+    if not index or not index.get("chunks"):
+        return []
+
+    chunks: list[Document] = index["chunks"]
+    parsed = parse_query(question)
+    companies: list[str] = parsed.get("companies") or []
+    req_year: int | None = parsed.get("fiscal_year")
+    doc_type: str = parsed.get("doc_type") or "annual_report"
+
+    # 第一道防线：如果有目标公司不在语料库中，直接拒答
+    comp_keys: list[str] = []
+    for c in companies:
+        ck = company_key(c)
+        if ck not in index["by_company"]:
+            return []
+        if ck not in comp_keys:
+            comp_keys.append(ck)
+
+    q_tokens = _bm25_tokenize(question, expand=True)
+    comp_word_set = {w for ck in comp_keys for w in ck.split()}
+    filtered_q_tokens = [t for t in q_tokens if t not in comp_word_set] or q_tokens
+
+    # 收集每个目标公司的候选 chunk 下标
+    candidate_indices: list[int] = []
+    if comp_keys:
+        per_comp_k = 12 if len(comp_keys) == 1 else 6
+        for ck in comp_keys:
+            avail_years = index["years_by_comp_type"].get((ck, doc_type), set())
+            target_years = _select_target_years(avail_years, req_year, doc_type)
+            if not target_years:
+                # 若所问年份在该文档类型下完全不存在，直接拒答
+                return []
+            pool: list[int] = []
+            for ty in target_years:
+                pool.extend(index["by_key"].get((ck, doc_type, ty), []))
+            if not pool:
+                return []
+            candidate_indices.extend(_bm25_rank_subset(pool, index, filtered_q_tokens, per_comp_k))
+    else:
+        # 极少数未解析出公司名的情况：全库 BM25
+        candidate_indices = _bm25_rank_subset(list(range(len(chunks))), index, q_tokens, 12)
+
+    # 去重并保持顺序
+    seen: set[int] = set()
+    unique_cands: list[int] = []
+    for idx in candidate_indices:
+        if idx not in seen:
+            seen.add(idx)
+            unique_cands.append(idx)
+
+    if not unique_cands:
+        return []
+
+    # 第二道防线 + LLM 精排：确认真的披露了该事实，并选出最精准的 <= 5 个 chunk
+    if _RERANK_LLM is None:
+        _RERANK_LLM = make_llm(temperature=0.0, thinking=False, max_tokens=200)
+
+    cand_lines = []
+    for pos, idx in enumerate(unique_cands):
+        c = chunks[idx]
+        m = c.metadata or {}
+        cand_lines.append(
+            f"[{pos}] company: {m.get('company')} | fiscal_year: {m.get('fiscal_year')} | doc_type: {m.get('doc_type')}\n{c.page_content}"
+        )
+    prompt = _RERANK_PROMPT.replace("{question}", question).replace("{candidates}", "\n\n".join(cand_lines))
+
+    try:
+        raw = str(_RERANK_LLM.invoke(prompt).content).strip()
+        m = re.search(r"\{.*\}", raw, re.S)
+        if m:
+            res = json.loads(m.group(0))
+            if not res.get("answerable", False):
+                return []
+            sel = [int(i) for i in (res.get("selected") or []) if isinstance(i, int) or str(i).isdigit()]
+            picked = []
+            used = set()
+            for pos in sel:
+                if 0 <= pos < len(unique_cands) and pos not in used:
+                    used.add(pos)
+                    picked.append(chunks[unique_cands[pos]])
+                if len(picked) >= MAX_RETRIEVED:
+                    break
+            if picked:
+                return picked
+            return []
+    except Exception:
+        pass
+
+    # 若精排 JSON 解析异常，降级返回 BM25 前几位（对比题保证每家至少 2 个）
+    if len(comp_keys) == 2:
+        picked = []
+        for ck in comp_keys:
+            comp_cands = [chunks[i] for i in unique_cands if company_key(chunks[i].metadata.get("company", "")) == ck]
+            picked.extend(comp_cands[:2])
+        return picked[:MAX_RETRIEVED]
+    return [chunks[i] for i in unique_cands[:MAX_RETRIEVED]]
 
 
 # =============================================================================
